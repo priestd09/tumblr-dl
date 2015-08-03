@@ -10,10 +10,14 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
-	"path"
+	//"os"
+	//"path"
 	"strconv"
 	"text/template"
+	"time"
+	"archive/zip"
+	//"strings"
+	"path"
 )
 
 // Session state keys.
@@ -118,7 +122,6 @@ func apiGet(cred *oauth.Credentials, urlStr string, form url.Values) (*http.Resp
 func decodeResponse(resp *http.Response, data interface{}) error {
 	if resp.StatusCode != 200 {
 		p, _ := ioutil.ReadAll(resp.Body)
-		fmt.Println(resp.Request.URL.String() + " " + string(p))
 		return fmt.Errorf("get %s returned status %d, %s", resp.Request.URL, resp.StatusCode, p)
 	}
 	return json.NewDecoder(resp.Body).Decode(data)
@@ -165,28 +168,68 @@ func getLikes(w http.ResponseWriter, r *http.Request, cred *oauth.Credentials, o
 
 func serveLikesDownload(w http.ResponseWriter, r *http.Request, cred *oauth.Credentials) {
 
-	for _, likes := range getAllLikes(w, r, cred) {
-		for _, posts := range likes.Response.LikedPosts {
-			folderName := "likes/" + fmt.Sprintf("%v", posts.ID)
-			os.MkdirAll(folderName, 0777)
-			fmt.Println("Create folder: " + folderName)
-			ioutil.WriteFile(folderName+"/"+"post.txt", []byte(posts.PostURL), 0644)
-			for _, photos := range posts.Photos {
+	zipfilename := fmt.Sprintf("tumblr-%d.zip", uint16(time.Now().UnixNano()))
 
-				url := photos.OriginalSize.URL
-				_, fileName := path.Split(url)
-				resp, _ := http.Get(photos.OriginalSize.URL)
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", zipfilename))
+	w.Header().Set("Connection", "close")
 
-				out, _ := os.Create(folderName + "/" + fileName)
-				fmt.Println("Create file: " + fileName)
-				defer out.Close()
+	zw := zip.NewWriter(w);
 
-				io.Copy(out, resp.Body)
-				defer resp.Body.Close()
+	likes := getAllLikes(w, r, cred)
 
+	for _, like := range likes {
+		for _, posts := range like.Response.LikedPosts {
+
+			postId := strconv.FormatInt(posts.ID, 10)
+			header := &zip.FileHeader{
+				Name:         postId + " /post.txt",
+				Method:       zip.Store,
+				ModifiedTime: uint16(time.Now().UnixNano()),
+				ModifiedDate: uint16(time.Now().UnixNano()),
 			}
 
+			fw, err := zw.CreateHeader(header)
+
+			if err != nil {
+				log.Printf("%s", err.Error())
+				http.Error(w, "Internal server error.", 500)
+				return
+			}
+			strconv.FormatInt(posts.ID, 10)
+			io.WriteString(fw, posts.PostURL)
+
+			for _, photos := range posts.Photos {
+				url := photos.OriginalSize.URL
+				_, fileName := path.Split(url)
+
+				header := &zip.FileHeader{
+					Name:         postId + "/" + fileName,
+					Method:       zip.Store,
+					ModifiedTime: uint16(time.Now().UnixNano()),
+					ModifiedDate: uint16(time.Now().UnixNano()),
+				}
+
+				fw, err := zw.CreateHeader(header)
+
+				if err != nil {
+					log.Printf("%s", err.Error())
+					http.Error(w, "Internal server error.", 500)
+					return
+				}
+
+				resp, _ := http.Get(photos.OriginalSize.URL)
+
+				io.Copy(fw, resp.Body)
+				defer resp.Body.Close()
+			}
 		}
+	}
+
+	if err := zw.Close(); err != nil {
+		log.Printf("%s", err.Error())
+		http.Error(w, "Internal server error.", 500)
+		return
 	}
 
 }
@@ -196,8 +239,13 @@ func serveLikes(w http.ResponseWriter, r *http.Request, cred *oauth.Credentials)
 }
 
 func main() {
+	println("Starting on port 9123")
 	if err := readCredentials(); err != nil {
-		log.Fatalf("Error reading configuration, %v", err)
+		log.Fatalf("Error reading configuration. %v", err)
+	}
+
+	if len(oauthClient.Credentials.Secret) < 16 || len(oauthClient.Credentials.Token) < 16 {
+		log.Fatalf("Error reading configuration. %v", "Secret or Token too short")
 	}
 
 	http.Handle("/", &authHandler{handler: serveHome, optional: true})
@@ -241,7 +289,8 @@ var (
 	{{range .Response.LikedPosts}}
 		<p>{{.PostURL}}</p>
 		{{range .Photos}}
-			<img src="{{.OriginalSize.URL}}">
+			{{$url := index .AltSizes 4}}
+			<img src="{{$url.URL}}">
 		{{end}}
 		<br>
 	{{end}}
@@ -267,8 +316,13 @@ type Likes struct {
 					Height int    `json:"height"`
 					URL    string `json:"url"`
 				} `json:"original_size"`
+				AltSizes []struct {
+					Width  int    `json:"width"`
+					Height int    `json:"height"`
+					URL    string `json:"url"`
+				} `json:"alt_sizes"`
 			} `json:"photos"`
-			LikedTimestamp int `json:"liked_timestamp"`
+			LikedTimestamp int64 `json:"liked_timestamp"`
 		} `json:"liked_posts"`
 		LikedCount int `json:"liked_count"`
 	} `json:"response"`
